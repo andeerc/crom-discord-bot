@@ -80,7 +80,10 @@ export class SummaryStoreService {
 
   saveSummary(input: SaveSummaryInput): void {
     const now = new Date().toISOString();
-    const transaction = this.db.transaction(() => {
+
+    try {
+      this.db.exec("BEGIN");
+
       this.db
         .prepare(
           `
@@ -133,8 +136,16 @@ export class SummaryStoreService {
           input.toTimestamp,
           now,
         );
-    });
 
-    transaction();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback errors after a failed transaction.
+      }
+
+      throw error;
+    }
   }
 }
