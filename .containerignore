@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+data
+dist
+docs
+node_modules
+scripts
+IDEAS.md
+crom.md
