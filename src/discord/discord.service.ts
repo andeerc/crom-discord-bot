@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import {
   ChannelType,
@@ -24,6 +24,7 @@ type FetchedMessage = {
 
 @Injectable()
 export class DiscordService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(DiscordService.name);
   private client: Client;
   private startupSyncHours: number;
   private startupSyncMaxMessagesPerChannel: number;
@@ -66,12 +67,12 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
   async onModuleInit() {
     const token = this.config.get("DISCORD_BOT_TOKEN");
     if (!token) {
-      console.error("DISCORD_BOT_TOKEN nao configurado.");
+      this.logger.error("DISCORD_BOT_TOKEN nao configurado.");
       return;
     }
 
     this.client.once("clientReady", async () => {
-      console.log(`Bot conectado como ${this.client.user?.tag}`);
+      this.logger.log(`Bot conectado como ${this.client.user?.tag}`);
       await this.registerCommandsForAllGuilds();
       await this.syncRecentMessagesOnStartup();
     });
@@ -80,7 +81,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       try {
         await this.registerCommandsForGuild(guild);
       } catch (error) {
-        console.error(
+        this.logger.error(
           `Erro ao registrar comandos na nova guild ${guild.id}:`,
           error,
         );
@@ -93,7 +94,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       try {
         await this.handleCommand(interaction);
       } catch (error) {
-        console.error("Erro ao processar comando:", error);
+        this.logger.error("Erro ao processar comando:", error);
 
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply("Erro ao processar comando.");
@@ -116,16 +117,16 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         this.summaryStore.saveMessages([
           this.toStoredMessageInput(message),
         ]);
-        console.log(`Mensagem ingerida em tempo real no canal ${message.channelId}: ${message.id}`);
+        this.logger.log(`Mensagem ingerida em tempo real no canal ${message.channelId}: ${message.id}`);
         this.summaryStore.upsertIngestCheckpoint(
           message.channelId,
           message.guildId || null,
           message.id,
           message.createdAt.toISOString(),
         );
-        console.log(`Checkpoint em tempo real atualizado no canal ${message.channelId}: ${message.id}`);
+        this.logger.log(`Checkpoint em tempo real atualizado no canal ${message.channelId}: ${message.id}`);
       } catch (error) {
-        console.error("Erro ao persistir mensagem do canal:", error);
+        this.logger.error("Erro ao persistir mensagem do canal:", error);
       }
 
       if (this.isBotMention(message)) {
@@ -231,7 +232,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         ),
       );
     } catch (error) {
-      console.error("Erro ao resumir:", error);
+      this.logger.error("Erro ao resumir:", error);
       await interaction.editReply(
         this.renderFailure(this.getUserFacingError(error)),
       );
@@ -257,7 +258,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
 
       await interaction.editReply(history || "Nenhuma mensagem encontrada.");
     } catch (error) {
-      console.error("Erro ao buscar historico:", error);
+      this.logger.error("Erro ao buscar historico:", error);
       await interaction.editReply(this.getUserFacingError(error));
     }
   }
@@ -306,7 +307,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       const finalReply = await loadingReply.edit(answer);
       this.summaryStore.saveMessages([this.toStoredMessageInput(finalReply)]);
     } catch (error) {
-      console.error("Erro ao responder mencao:", error);
+      this.logger.error("Erro ao responder mencao:", error);
       await loadingReply.edit(this.getUserFacingError(error));
     }
   }
@@ -356,7 +357,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     const guilds = Array.from(this.client.guilds.cache.values());
 
     if (guilds.length === 0) {
-      console.warn("Nenhuma guild disponivel para registrar comandos.");
+      this.logger.warn("Nenhuma guild disponivel para registrar comandos.");
       return;
     }
 
@@ -369,15 +370,15 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     const commands = this.getCommands();
 
     await guild.commands.set(commands);
-    console.log(`Slash commands registrados na guild ${guild.id}.`);
+    this.logger.log(`Slash commands registrados na guild ${guild.id}.`);
   }
 
   private async syncRecentMessagesOnStartup() {
     const guilds = Array.from(this.client.guilds.cache.values());
-    console.log(`Iniciando sync de startup em ${guilds.length} guild(s).`);
+    this.logger.log(`Iniciando sync de startup em ${guilds.length} guild(s).`);
 
     for (const guild of guilds) {
-      console.log(`Sync startup: guild ${guild.id}`);
+      this.logger.log(`Sync startup: guild ${guild.id}`);
       try {
         await guild.channels.fetch();
         const channels = Array.from(guild.channels.cache.values());
@@ -390,7 +391,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
           await this.syncChannelRecentMessages(channel);
         }
       } catch (error) {
-        console.error(
+        this.logger.error(
           `Erro ao sincronizar mensagens no startup da guild ${guild.id}:`,
           error,
         );
@@ -427,7 +428,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     );
     const storedMessages = [];
     const checkpoint = this.summaryStore.getIngestCheckpoint(channel.id);
-    console.log(`Sync startup: canal ${channel.id} | checkpoint=${checkpoint?.lastMessageId || "nenhum"} | janela=${this.startupSyncHours}h`);
+    this.logger.log(`Sync startup: canal ${channel.id} | checkpoint=${checkpoint?.lastMessageId || "nenhum"} | janela=${this.startupSyncHours}h`);
     const checkpointId = checkpoint?.lastMessageId
       ? BigInt(checkpoint.lastMessageId)
       : null;
@@ -444,7 +445,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         });
 
         if (fetched.size === 0) {
-          console.log(`Sync startup: canal ${channel.id} sem mais mensagens para paginação.`);
+          this.logger.log(`Sync startup: canal ${channel.id} sem mais mensagens para paginação.`);
           break;
         }
 
@@ -487,11 +488,11 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         const oldest = batch[0];
         if (!oldest || reachedCheckpoint || reachedCutoff) {
           if (reachedCheckpoint) {
-            console.log(`Sync startup: canal ${channel.id} parou ao atingir checkpoint.`);
+            this.logger.log(`Sync startup: canal ${channel.id} parou ao atingir checkpoint.`);
           }
 
           if (reachedCutoff) {
-            console.log(`Sync startup: canal ${channel.id} parou ao atingir cutoff da janela.`);
+            this.logger.log(`Sync startup: canal ${channel.id} parou ao atingir cutoff da janela.`);
           }
 
           break;
@@ -502,7 +503,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
 
       this.summaryStore.saveMessages(storedMessages);
 
-      console.log(`Sync startup: canal ${channel.id} persistiu ${storedMessages.length} mensagem(ns).`);
+      this.logger.log(`Sync startup: canal ${channel.id} persistiu ${storedMessages.length} mensagem(ns).`);
 
       if (newestSeenMessage) {
         this.summaryStore.upsertIngestCheckpoint(
@@ -511,10 +512,10 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
           newestSeenMessage.id,
           newestSeenMessage.createdAt?.toISOString?.() || null,
         );
-        console.log(`Sync startup: checkpoint atualizado no canal ${channel.id} para ${newestSeenMessage.id}.`);
+        this.logger.log(`Sync startup: checkpoint atualizado no canal ${channel.id} para ${newestSeenMessage.id}.`);
       }
     } catch (error) {
-      console.error(
+      this.logger.error(
         `Erro ao sincronizar mensagens do canal ${channel.id} no startup:`,
         error,
       );
@@ -691,7 +692,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         });
 
         if (fetched.size === 0) {
-          console.log(`Sync startup: canal ${channel.id} sem mais mensagens para paginação.`);
+          this.logger.log(`Sync startup: canal ${channel.id} sem mais mensagens para paginação.`);
           break;
         }
 
@@ -741,7 +742,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         }
       }
     } catch (error) {
-      console.error("Erro ao buscar mensagens:", error);
+      this.logger.error("Erro ao buscar mensagens:", error);
       if (
         error &&
         typeof error === "object" &&
