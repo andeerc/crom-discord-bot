@@ -1,13 +1,15 @@
 # Discord Bot de Resumo com NestJS
 
-Bot para Discord que resume mensagens de um canal usando a API da OpenCode e salva checkpoints em SQLite para fazer resumos incrementais.
+Bot para Discord que resume mensagens de um canal usando a API da OpenCode, guarda memoria recente em SQLite e responde tanto por slash command quanto por `@mencao`.
 
 ## Funcionalidades
 
 - Comando `/resumir` com filtro por horas e limite de mensagens.
 - Atualizacao de status na mesma resposta do Discord enquanto o resumo e processado.
 - Resumo incremental por canal: depois do primeiro resumo, o bot considera apenas mensagens novas.
-- Persistencia em SQLite do historico de resumos e do ultimo `message_id` resumido por canal.
+- Persistencia em SQLite do historico de resumos, do ultimo `message_id` resumido por canal e das mensagens dos ultimos 3 dias.
+- Sincronizacao inicial no startup para puxar pelo menos as ultimas 12 horas de mensagens dos canais acessiveis.
+- Resposta por `@mencao` ao bot com uso do contexto recente do canal e do ultimo resumo salvo.
 - Comando `/historico` para listar mensagens recentes sem chamar a IA.
 - Fallback local simples quando `OPENCODE_API_KEY` nao estiver configurada ou a chamada externa falhar.
 
@@ -47,6 +49,9 @@ Copie `.env.example` para `.env` e preencha os valores.
 | `OPENCODE_API_BASE` | nao | Base da API da OpenCode | `https://opencode.ai/zen/v1` |
 | `OPENCODE_MODEL` | nao | Modelo enviado no campo `model` da API | `minimax-m2.5-free` |
 | `SQLITE_PATH` | nao | Caminho do banco SQLite local | `data/summaries.sqlite` |
+| `MESSAGE_RETENTION_DAYS` | nao | Quantos dias de mensagens recentes ficam no SQLite | `3` |
+| `STARTUP_SYNC_HOURS` | nao | Quantas horas o bot tenta hidratar no startup | `12` |
+| `STARTUP_SYNC_MAX_MESSAGES_PER_CHANNEL` | nao | Limite de mensagens sincronizadas por canal no startup | `500` |
 
 ## Instalacao
 
@@ -78,12 +83,13 @@ npm run start:prod
 
 ```text
 Bot conectado como ...
-Slash commands registrados na guild.
+Slash commands registrados na guild <id>.
 ```
 
 Observacao:
 
-- O registro de slash commands hoje acontece na primeira guild carregada em `client.guilds.cache.first()`.
+- O bot registra slash commands em todas as guilds carregadas no startup.
+- Quando entra em uma guild nova, registra automaticamente os comandos nela.
 
 ## Comandos do bot
 
@@ -124,12 +130,39 @@ Opcao:
 
 - `mensagens`: minimo `5`, maximo `50`, default `20`.
 
+### `@bot ...`
+
+Quando um usuario menciona o bot em um canal, ele responde como assistente usando:
+
+- mensagens salvas no SQLite dos ultimos 3 dias
+- filtro heuristico para puxar mensagens mais relevantes para o pedido
+- ultimo resumo salvo do canal, quando existir
+
+Exemplos:
+
+```text
+@bot me resume o que estavam falando hoje
+@bot o que o Joao falou sobre deploy?
+@bot me atualiza do que mudou desde ontem
+```
+
+Comportamento:
+
+1. O bot salva a mensagem do usuario no SQLite.
+2. Remove a mencao do texto e trata o resto como prompt.
+3. Busca contexto recente do mesmo canal.
+4. Tenta filtrar mensagens mais relevantes pelos termos do pedido.
+5. Envia contexto + ultimo resumo do canal para a OpenCode.
+6. Responde no proprio canal.
+7. Salva a resposta final dele tambem no SQLite.
+
 ## Como funciona o resumo incremental
 
 O projeto salva dois tipos de dado:
 
 - `summary_checkpoints`: ultimo resumo por canal
 - `summaries`: historico completo dos resumos gerados
+- `channel_messages`: memoria recente de mensagens por canal
 
 Campos principais persistidos:
 
@@ -150,6 +183,29 @@ Fluxo incremental:
    o bot continua buscando do mais recente para tras, mas interrompe ao encontrar o ultimo `message_id` salvo no checkpoint.
 
 Isso evita resumir repetidamente o mesmo conteudo para pessoas diferentes no mesmo canal.
+
+## Memoria de mensagens
+
+O bot tambem guarda mensagens recentes em SQLite para sustentar o modo conversacional por `@mencao`.
+
+Campos principais persistidos em `channel_messages`:
+
+- `message_id`
+- `guild_id`
+- `channel_id`
+- `author_id`
+- `author_username`
+- `author_display_name`
+- `content`
+- `created_at`
+
+Politica atual:
+
+- mensagens de bots sao ignoradas
+- mensagens vazias sao ignoradas
+- a retencao padrao e de 3 dias
+- o armazenamento usa upsert por `message_id`
+- no startup, o bot tenta hidratar pelo menos as ultimas 12 horas dos canais acessiveis
 
 ## OpenCode
 
@@ -194,6 +250,7 @@ Tabelas:
 .tables
 SELECT * FROM summary_checkpoints;
 SELECT id, channel_id, message_count, created_at FROM summaries ORDER BY id DESC;
+SELECT channel_id, author_display_name, created_at FROM channel_messages ORDER BY created_at DESC LIMIT 20;
 ```
 
 ## Observacoes operacionais
@@ -202,6 +259,9 @@ SELECT id, channel_id, message_count, created_at FROM summaries ORDER BY id DESC
 - O bot ignora mensagens vazias no resumo incremental.
 - O nome usado no contexto do resumo prioriza apelido no servidor (`displayName`), depois `globalName`, depois `username`.
 - O status do `/resumir` e atualizado sempre na mesma resposta da interacao.
+- O modo `@mencao` depende da memoria local do SQLite e de um filtro heuristico simples por termos.
+- Se o canal tiver pouco contexto salvo, a resposta por mencao pode ficar mais generica.
+- O bot precisa de `View Channel` e `Read Message History` para ler e hidratar canais.
 
 ## Arquivos importantes
 
@@ -211,6 +271,7 @@ SELECT id, channel_id, message_count, created_at FROM summaries ORDER BY id DESC
 
 ## Riscos e proximos ajustes
 
-- O registro de comandos por `guilds.cache.first()` funciona para servidor de teste, mas e fragil para multi-guild. O ideal e registrar por `DISCORD_GUILD_ID`.
+- O filtro de relevancia do modo `@mencao` ainda e heuristico; nomes ambiguos e pedidos muito amplos ainda podem puxar contexto ruim.
+- O startup sync pode ficar caro em servidores com muitos canais acessiveis; por isso existe limite por canal.
 - O filtro por janela de tempo ainda depende da leitura paginada recente do canal; para canais muito movimentados, o limite de mensagens continua mandando no volume maximo analisado.
 - O projeto nao tem testes automatizados ainda.

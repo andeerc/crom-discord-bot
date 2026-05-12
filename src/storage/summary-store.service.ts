@@ -24,14 +24,51 @@ export type SaveSummaryInput = {
   summary: string;
 };
 
+export type StoredSummary = {
+  id: number;
+  channelId: string;
+  guildId: string | null;
+  fromMessageId: string | null;
+  toMessageId: string;
+  fromTimestamp: string;
+  toTimestamp: string;
+  messageCount: number;
+  summary: string;
+  createdAt: string;
+};
+
+export type SaveMessageInput = {
+  guildId: string | null;
+  channelId: string;
+  messageId: string;
+  authorId: string;
+  authorUsername: string;
+  authorDisplayName: string;
+  content: string;
+  createdAt: string;
+};
+
+export type StoredMessage = {
+  guildId: string | null;
+  channelId: string;
+  messageId: string;
+  authorId: string;
+  authorUsername: string;
+  authorDisplayName: string;
+  content: string;
+  createdAt: string;
+};
+
 @Injectable()
 export class SummaryStoreService {
   private db: any;
+  private retentionDays: number;
 
   constructor(private config: ConfigService) {
     const dbPath = resolve(
       this.config.get("SQLITE_PATH") || "data/summaries.sqlite",
     );
+    this.retentionDays = Number(this.config.get("MESSAGE_RETENTION_DAYS") || 3);
 
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
@@ -56,7 +93,20 @@ export class SummaryStoreService {
         summary TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
+
+      CREATE TABLE IF NOT EXISTS channel_messages (
+        message_id TEXT PRIMARY KEY,
+        guild_id TEXT,
+        channel_id TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        author_username TEXT NOT NULL,
+        author_display_name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
+
+    this.pruneOldMessages();
   }
 
   getCheckpoint(channelId: string): SummaryCheckpoint | null {
@@ -71,6 +121,32 @@ export class SummaryStoreService {
             last_summary_at as lastSummaryAt
           FROM summary_checkpoints
           WHERE channel_id = ?
+        `,
+      )
+      .get(channelId);
+
+    return row || null;
+  }
+
+  getLatestSummary(channelId: string): StoredSummary | null {
+    const row = this.db
+      .prepare(
+        `
+          SELECT
+            id,
+            channel_id as channelId,
+            guild_id as guildId,
+            from_message_id as fromMessageId,
+            to_message_id as toMessageId,
+            from_timestamp as fromTimestamp,
+            to_timestamp as toTimestamp,
+            message_count as messageCount,
+            summary,
+            created_at as createdAt
+          FROM summaries
+          WHERE channel_id = ?
+          ORDER BY id DESC
+          LIMIT 1
         `,
       )
       .get(channelId);
@@ -147,5 +223,110 @@ export class SummaryStoreService {
 
       throw error;
     }
+  }
+
+  saveMessage(input: SaveMessageInput): void {
+    this.db
+      .prepare(
+        `
+          INSERT INTO channel_messages (
+            message_id,
+            guild_id,
+            channel_id,
+            author_id,
+            author_username,
+            author_display_name,
+            content,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(message_id) DO UPDATE SET
+            guild_id = excluded.guild_id,
+            channel_id = excluded.channel_id,
+            author_id = excluded.author_id,
+            author_username = excluded.author_username,
+            author_display_name = excluded.author_display_name,
+            content = excluded.content,
+            created_at = excluded.created_at
+        `,
+      )
+      .run(
+        input.messageId,
+        input.guildId,
+        input.channelId,
+        input.authorId,
+        input.authorUsername,
+        input.authorDisplayName,
+        input.content,
+        input.createdAt,
+      );
+  }
+
+  saveMessages(inputs: SaveMessageInput[]): void {
+    if (inputs.length === 0) {
+      return;
+    }
+
+    try {
+      this.db.exec("BEGIN");
+
+      for (const input of inputs) {
+        this.saveMessage(input);
+      }
+
+      this.db.exec("COMMIT");
+      this.pruneOldMessages();
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback errors after a failed transaction.
+      }
+
+      throw error;
+    }
+  }
+
+  getStoredMessages(
+    channelId: string,
+    sinceIso: string,
+    limit: number,
+  ): StoredMessage[] {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT
+            guild_id as guildId,
+            channel_id as channelId,
+            message_id as messageId,
+            author_id as authorId,
+            author_username as authorUsername,
+            author_display_name as authorDisplayName,
+            content,
+            created_at as createdAt
+          FROM channel_messages
+          WHERE channel_id = ?
+            AND created_at >= ?
+          ORDER BY created_at ASC
+          LIMIT ?
+        `,
+      )
+      .all(channelId, sinceIso, limit);
+
+    return rows || [];
+  }
+
+  pruneOldMessages(): void {
+    const cutoff = new Date(
+      Date.now() - this.retentionDays * 24 * 60 * 60 * 1000,
+    ).toISOString();
+
+    this.db
+      .prepare(
+        `
+          DELETE FROM channel_messages
+          WHERE created_at < ?
+        `,
+      )
+      .run(cutoff);
   }
 }

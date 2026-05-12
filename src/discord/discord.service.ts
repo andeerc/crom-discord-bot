@@ -5,14 +5,18 @@ import {
   Client,
   GatewayIntentBits,
   Guild,
+  Message,
   PermissionFlagsBits,
   TextBasedChannel,
 } from "discord.js";
-import { SummaryStoreService } from "src/storage/summary-store.service";
+import { StoredMessage, SummaryStoreService } from "src/storage/summary-store.service";
 import { SummarizerService } from "src/summarizer/summarizer.service";
 
 type FetchedMessage = {
   id: string;
+  authorId: string;
+  authorUsername: string;
+  authorDisplayName: string;
   content: string;
   author: string;
   timestamp: Date;
@@ -21,6 +25,8 @@ type FetchedMessage = {
 @Injectable()
 export class DiscordService implements OnModuleInit, OnModuleDestroy {
   private client: Client;
+  private startupSyncHours: number;
+  private startupSyncMaxMessagesPerChannel: number;
 
   constructor(
     private config: ConfigService,
@@ -34,6 +40,12 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         GatewayIntentBits.MessageContent,
       ],
     });
+    this.startupSyncHours = Number(
+      this.config.get("STARTUP_SYNC_HOURS") || 12,
+    );
+    this.startupSyncMaxMessagesPerChannel = Number(
+      this.config.get("STARTUP_SYNC_MAX_MESSAGES_PER_CHANNEL") || 500,
+    );
   }
 
   async onModuleInit() {
@@ -46,6 +58,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     this.client.once("clientReady", async () => {
       console.log(`Bot conectado como ${this.client.user?.tag}`);
       await this.registerCommandsForAllGuilds();
+      await this.syncRecentMessagesOnStartup();
     });
 
     this.client.on("guildCreate", async (guild) => {
@@ -79,6 +92,24 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
+    this.client.on("messageCreate", async (message) => {
+      if (!message.inGuild() || message.author.bot || !message.content.trim()) {
+        return;
+      }
+
+      try {
+        this.summaryStore.saveMessages([
+          this.toStoredMessageInput(message),
+        ]);
+      } catch (error) {
+        console.error("Erro ao persistir mensagem do canal:", error);
+      }
+
+      if (this.isBotMention(message)) {
+        await this.handleMention(message);
+      }
+    });
+
     await this.client.login(token);
   }
 
@@ -105,6 +136,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     const hoursAgo = options.getInteger("horas") || 1;
     const limit = options.getInteger("mensagens") || 50;
     const checkpoint = this.summaryStore.getCheckpoint(channel.id);
+    const latestSummary = this.summaryStore.getLatestSummary(channel.id);
 
     await interaction.deferReply();
     await interaction.editReply(this.renderProgress("Buscando mensagens do canal"));
@@ -144,7 +176,10 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         this.renderProgress("Gerando resumo com OpenCode"),
       );
 
-      const summary = await this.summarizer.summarize(formattedMessages);
+      const summary = await this.summarizer.summarize(
+        formattedMessages,
+        latestSummary?.summary || null,
+      );
 
       this.summaryStore.saveSummary({
         channelId: channel.id,
@@ -194,6 +229,37 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       console.error("Erro ao buscar historico:", error);
       await interaction.editReply(this.getUserFacingError(error));
+    }
+  }
+
+  private async handleMention(message: Message) {
+    const prompt = this.stripBotMention(message.content).trim();
+
+    if (!prompt) {
+      await message.reply("Mande a pergunta junto com a mencao.");
+      return;
+    }
+
+    const loadingReply = await message.reply("Pensando...");
+
+    try {
+      const latestSummary = this.summaryStore.getLatestSummary(message.channelId);
+      const contextMessages = this.getMentionContextMessages(
+        message.channelId,
+        prompt,
+      );
+      const formattedContext = this.formatStoredMessages(contextMessages);
+      const answer = await this.summarizer.answerMention(
+        prompt,
+        formattedContext,
+        latestSummary?.summary || null,
+      );
+
+      const finalReply = await loadingReply.edit(answer);
+      this.summaryStore.saveMessages([this.toStoredMessageInput(finalReply)]);
+    } catch (error) {
+      console.error("Erro ao responder mencao:", error);
+      await loadingReply.edit(this.getUserFacingError(error));
     }
   }
 
@@ -258,6 +324,233 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     console.log(`Slash commands registrados na guild ${guild.id}.`);
   }
 
+  private async syncRecentMessagesOnStartup() {
+    const guilds = Array.from(this.client.guilds.cache.values());
+
+    for (const guild of guilds) {
+      try {
+        await guild.channels.fetch();
+        const channels = Array.from(guild.channels.cache.values());
+
+        for (const channel of channels) {
+          if (!this.canSyncChannel(channel)) {
+            continue;
+          }
+
+          await this.syncChannelRecentMessages(channel);
+        }
+      } catch (error) {
+        console.error(
+          `Erro ao sincronizar mensagens no startup da guild ${guild.id}:`,
+          error,
+        );
+      }
+    }
+  }
+
+  private canSyncChannel(channel: any): boolean {
+    const botUser = this.client.user;
+
+    if (!botUser || !channel) {
+      return false;
+    }
+
+    if (typeof channel.isTextBased !== "function" || !channel.isTextBased()) {
+      return false;
+    }
+
+    if (!("messages" in channel) || typeof channel.permissionsFor !== "function") {
+      return false;
+    }
+
+    const permissions = channel.permissionsFor(botUser);
+    return !!(
+      permissions &&
+      permissions.has(PermissionFlagsBits.ViewChannel) &&
+      permissions.has(PermissionFlagsBits.ReadMessageHistory)
+    );
+  }
+
+  private async syncChannelRecentMessages(channel: any) {
+    const cutoff = new Date(
+      Date.now() - this.startupSyncHours * 60 * 60 * 1000,
+    );
+    const storedMessages = [];
+    let before: string | undefined;
+    let synced = 0;
+
+    try {
+      while (synced < this.startupSyncMaxMessagesPerChannel) {
+        const remaining = this.startupSyncMaxMessagesPerChannel - synced;
+        const fetched = await channel.messages.fetch({
+          limit: Math.min(100, remaining),
+          before,
+        });
+
+        if (fetched.size === 0) {
+          break;
+        }
+
+        const batch = Array.from(fetched.values()) as any[];
+        batch.sort(
+          (left, right) => left.createdTimestamp - right.createdTimestamp,
+        );
+
+        for (const message of batch) {
+          if (message.createdAt < cutoff) {
+            continue;
+          }
+
+          if (message.author.bot || !message.content.trim()) {
+            continue;
+          }
+
+          storedMessages.push(this.toStoredMessageInput(message));
+          synced += 1;
+
+          if (synced >= this.startupSyncMaxMessagesPerChannel) {
+            break;
+          }
+        }
+
+        const oldest = fetched.last();
+        if (!oldest) {
+          break;
+        }
+
+        before = oldest.id;
+
+        if (oldest.createdAt < cutoff) {
+          break;
+        }
+      }
+
+      this.summaryStore.saveMessages(storedMessages);
+    } catch (error) {
+      console.error(
+        `Erro ao sincronizar mensagens do canal ${channel.id} no startup:`,
+        error,
+      );
+    }
+  }
+
+  private isBotMention(message: Message): boolean {
+    const botUser = this.client.user;
+
+    if (!botUser) {
+      return false;
+    }
+
+    return message.mentions.users.has(botUser.id);
+  }
+
+  private stripBotMention(content: string): string {
+    const botUser = this.client.user;
+
+    if (!botUser) {
+      return content;
+    }
+
+    const mentionRegex = new RegExp(`<@!?${botUser.id}>`, "g");
+    return content.replace(mentionRegex, "").trim();
+  }
+
+  private getMentionContextMessages(
+    channelId: string,
+    prompt: string,
+  ): StoredMessage[] {
+    const sinceIso = new Date(
+      Date.now() - 3 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const recentMessages = this.summaryStore.getStoredMessages(
+      channelId,
+      sinceIso,
+      150,
+    );
+    const relevantMessages = this.filterRelevantMessages(recentMessages, prompt);
+
+    if (relevantMessages.length > 0) {
+      return relevantMessages.slice(-80);
+    }
+
+    return recentMessages.slice(-80);
+  }
+
+  private filterRelevantMessages(
+    messages: StoredMessage[],
+    prompt: string,
+  ): StoredMessage[] {
+    const tokens = prompt
+      .toLowerCase()
+      .split(/[^a-z0-9_@-]+/i)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 2)
+      .filter((token) => !this.isStopWord(token));
+
+    if (tokens.length === 0) {
+      return [];
+    }
+
+    return messages.filter((message) => {
+      const haystack = [
+        message.authorDisplayName,
+        message.authorUsername,
+        message.content,
+      ]
+        .join(" ")
+        .toLowerCase();
+
+      return tokens.some((token) => haystack.includes(token));
+    });
+  }
+
+  private isStopWord(token: string): boolean {
+    return new Set([
+      "que",
+      "como",
+      "para",
+      "com",
+      "por",
+      "uma",
+      "umas",
+      "dos",
+      "das",
+      "nos",
+      "nas",
+      "sobre",
+      "bot",
+      "me",
+      "de",
+      "da",
+      "do",
+      "um",
+      "uma",
+      "ele",
+      "ela",
+      "isso",
+      "esse",
+      "essa",
+      "esta",
+      "este",
+      "estao",
+      "qual",
+      "quais",
+      "fale",
+      "fala",
+      "resuma",
+      "resumo",
+    ]).has(token);
+  }
+
+  private formatStoredMessages(messages: StoredMessage[]): string {
+    return messages
+      .map((message) => {
+        const timestamp = new Date(message.createdAt).toLocaleString("pt-BR");
+        return `[${timestamp}] ${message.authorDisplayName}: ${message.content}`;
+      })
+      .join("\n");
+  }
+
   private assertReadableChannel(interaction: any) {
     const channel = interaction.channel;
     const botUser = this.client.user;
@@ -290,6 +583,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     lastSummarizedMessageId: string | null,
   ): Promise<FetchedMessage[]> {
     const messages: FetchedMessage[] = [];
+    const storedMessages = [];
     const cutoff = new Date(Date.now() - hoursAgo * 60 * 60 * 1000);
     const checkpointId = lastSummarizedMessageId
       ? BigInt(lastSummarizedMessageId)
@@ -328,6 +622,12 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
 
           messages.push({
             id: msg.id,
+            authorId: msg.author.id,
+            authorUsername: msg.author.username,
+            authorDisplayName:
+              msg.member?.displayName ||
+              msg.author.globalName ||
+              msg.author.username,
             content: msg.content,
             author:
               msg.member?.displayName ||
@@ -335,6 +635,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
               msg.author.username,
             timestamp: msg.createdAt,
           });
+          storedMessages.push(this.toStoredMessageInput(msg));
 
           if (messages.length >= limit) {
             break;
@@ -368,9 +669,27 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       throw error;
     }
 
+    this.summaryStore.saveMessages(storedMessages);
+
     return messages.sort(
       (left, right) => left.timestamp.getTime() - right.timestamp.getTime(),
     );
+  }
+
+  private toStoredMessageInput(message: any) {
+    return {
+      guildId: message.guildId || null,
+      channelId: message.channelId,
+      messageId: message.id,
+      authorId: message.author.id,
+      authorUsername: message.author.username,
+      authorDisplayName:
+        message.member?.displayName ||
+        message.author.globalName ||
+        message.author.username,
+      content: message.content,
+      createdAt: message.createdAt.toISOString(),
+    };
   }
 
   private getUserFacingError(error: unknown): string {
