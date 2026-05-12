@@ -1,6 +1,13 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { Client, GatewayIntentBits, TextBasedChannel } from "discord.js";
+import {
+  ChannelType,
+  Client,
+  GatewayIntentBits,
+  Guild,
+  PermissionFlagsBits,
+  TextBasedChannel,
+} from "discord.js";
 import { SummaryStoreService } from "src/storage/summary-store.service";
 import { SummarizerService } from "src/summarizer/summarizer.service";
 
@@ -38,7 +45,18 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
 
     this.client.once("clientReady", async () => {
       console.log(`Bot conectado como ${this.client.user?.tag}`);
-      await this.registerCommands();
+      await this.registerCommandsForAllGuilds();
+    });
+
+    this.client.on("guildCreate", async (guild) => {
+      try {
+        await this.registerCommandsForGuild(guild);
+      } catch (error) {
+        console.error(
+          `Erro ao registrar comandos na nova guild ${guild.id}:`,
+          error,
+        );
+      }
     });
 
     this.client.on("interactionCreate", async (interaction) => {
@@ -92,6 +110,8 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     await interaction.editReply(this.renderProgress("Buscando mensagens do canal"));
 
     try {
+      this.assertReadableChannel(interaction);
+
       const messages = await this.fetchMessages(
         channel,
         hoursAgo,
@@ -148,7 +168,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       console.error("Erro ao resumir:", error);
       await interaction.editReply(
-        this.renderFailure("Erro ao gerar resumo. Tente novamente."),
+        this.renderFailure(this.getUserFacingError(error)),
       );
     }
   }
@@ -160,6 +180,8 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     await interaction.deferReply();
 
     try {
+      this.assertReadableChannel(interaction);
+
       const messages = await this.fetchMessages(channel, 24, limit, null);
       const history = messages
         .map(
@@ -171,12 +193,12 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       await interaction.editReply(history || "Nenhuma mensagem encontrada.");
     } catch (error) {
       console.error("Erro ao buscar historico:", error);
-      await interaction.editReply("Erro ao buscar historico.");
+      await interaction.editReply(this.getUserFacingError(error));
     }
   }
 
-  private async registerCommands() {
-    const commands = [
+  private getCommands() {
+    return [
       {
         name: "resumir",
         description: "Resume mensagens novas do canal",
@@ -214,15 +236,50 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         ],
       },
     ];
+  }
 
-    try {
-      const guild = this.client.guilds.cache.first();
-      if (guild) {
-        await guild.commands.set(commands);
-        console.log("Slash commands registrados na guild.");
-      }
-    } catch (error) {
-      console.error("Erro ao registrar comandos:", error);
+  private async registerCommandsForAllGuilds() {
+    const guilds = Array.from(this.client.guilds.cache.values());
+
+    if (guilds.length === 0) {
+      console.warn("Nenhuma guild disponivel para registrar comandos.");
+      return;
+    }
+
+    for (const guild of guilds) {
+      await this.registerCommandsForGuild(guild);
+    }
+  }
+
+  private async registerCommandsForGuild(guild: Guild) {
+    const commands = this.getCommands();
+
+    await guild.commands.set(commands);
+    console.log(`Slash commands registrados na guild ${guild.id}.`);
+  }
+
+  private assertReadableChannel(interaction: any) {
+    const channel = interaction.channel;
+    const botUser = this.client.user;
+
+    if (!channel || channel.type === ChannelType.DM || !botUser) {
+      throw new Error("Canal invalido para leitura de mensagens.");
+    }
+
+    if (typeof channel.permissionsFor !== "function") {
+      throw new Error("Canal nao suporta leitura de mensagens.");
+    }
+
+    const permissions = channel.permissionsFor(botUser);
+
+    if (
+      !permissions ||
+      !permissions.has(PermissionFlagsBits.ViewChannel) ||
+      !permissions.has(PermissionFlagsBits.ReadMessageHistory)
+    ) {
+      throw new Error(
+        "Bot sem permissao para ver o canal ou ler o historico de mensagens.",
+      );
     }
   }
 
@@ -297,11 +354,31 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       }
     } catch (error) {
       console.error("Erro ao buscar mensagens:", error);
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === 50001
+      ) {
+        throw new Error(
+          "Bot sem acesso a esse canal. Verifique as permissoes de View Channel e Read Message History.",
+        );
+      }
+
+      throw error;
     }
 
     return messages.sort(
       (left, right) => left.timestamp.getTime() - right.timestamp.getTime(),
     );
+  }
+
+  private getUserFacingError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return "Erro ao processar comando.";
   }
 
   private renderProgress(step: string): string {
