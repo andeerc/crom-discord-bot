@@ -1,8 +1,9 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 
 @Injectable()
 export class SummarizerService {
+  private readonly logger = new Logger(SummarizerService.name);
   private apiKey?: string;
   private baseUrl: string;
   private model: string;
@@ -90,7 +91,7 @@ export class SummarizerService {
 
       return output;
     } catch (error) {
-      console.error("Erro na API da OpenCode:", error);
+      this.logger.error("Erro na API da OpenCode:", error);
       return this.simpleSummarize(messages, previousSummary);
     }
   }
@@ -175,7 +176,7 @@ export class SummarizerService {
 
       return output;
     } catch (error) {
-      console.error("Erro na API da OpenCode:", error);
+      this.logger.error("Erro na API da OpenCode:", error);
       return this.simpleMentionReply(userPrompt, contextMessages, previousSummary);
     }
   }
