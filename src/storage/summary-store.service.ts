@@ -48,6 +48,15 @@ export type SaveMessageInput = {
   createdAt: string;
 };
 
+
+export type IngestCheckpoint = {
+  channelId: string;
+  guildId: string | null;
+  lastMessageId: string;
+  lastMessageTimestamp: string | null;
+  updatedAt: string;
+};
+
 export type StoredMessage = {
   guildId: string | null;
   channelId: string;
@@ -103,6 +112,14 @@ export class SummaryStoreService {
         author_display_name TEXT NOT NULL,
         content TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ingest_checkpoints (
+        channel_id TEXT PRIMARY KEY,
+        guild_id TEXT,
+        last_message_id TEXT NOT NULL,
+        last_message_timestamp TEXT,
+        updated_at TEXT NOT NULL
       );
     `);
 
@@ -313,6 +330,53 @@ export class SummaryStoreService {
       .all(channelId, sinceIso, limit);
 
     return rows || [];
+  }
+
+  getIngestCheckpoint(channelId: string): IngestCheckpoint | null {
+    const row = this.db
+      .prepare(
+        `
+          SELECT
+            channel_id as channelId,
+            guild_id as guildId,
+            last_message_id as lastMessageId,
+            last_message_timestamp as lastMessageTimestamp,
+            updated_at as updatedAt
+          FROM ingest_checkpoints
+          WHERE channel_id = ?
+        `,
+      )
+      .get(channelId);
+
+    return row || null;
+  }
+
+  upsertIngestCheckpoint(
+    channelId: string,
+    guildId: string | null,
+    lastMessageId: string,
+    lastMessageTimestamp: string | null,
+  ): void {
+    const now = new Date().toISOString();
+
+    this.db
+      .prepare(
+        `
+          INSERT INTO ingest_checkpoints (
+            channel_id,
+            guild_id,
+            last_message_id,
+            last_message_timestamp,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(channel_id) DO UPDATE SET
+            guild_id = excluded.guild_id,
+            last_message_id = excluded.last_message_id,
+            last_message_timestamp = excluded.last_message_timestamp,
+            updated_at = excluded.updated_at
+        `,
+      )
+      .run(channelId, guildId, lastMessageId, lastMessageTimestamp, now);
   }
 
   pruneOldMessages(): void {

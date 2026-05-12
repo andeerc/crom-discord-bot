@@ -27,6 +27,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
   private client: Client;
   private startupSyncHours: number;
   private startupSyncMaxMessagesPerChannel: number;
+  private mentionContextHours: number;
 
   constructor(
     private config: ConfigService,
@@ -45,6 +46,9 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     );
     this.startupSyncMaxMessagesPerChannel = Number(
       this.config.get("STARTUP_SYNC_MAX_MESSAGES_PER_CHANNEL") || 500,
+    );
+    this.mentionContextHours = Number(
+      this.config.get("MENTION_CONTEXT_HOURS") || 6,
     );
   }
 
@@ -101,6 +105,12 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         this.summaryStore.saveMessages([
           this.toStoredMessageInput(message),
         ]);
+        this.summaryStore.upsertIngestCheckpoint(
+          message.channelId,
+          message.guildId || null,
+          message.id,
+          message.createdAt.toISOString(),
+        );
       } catch (error) {
         console.error("Erro ao persistir mensagem do canal:", error);
       }
@@ -376,7 +386,8 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       Date.now() - this.startupSyncHours * 60 * 60 * 1000,
     );
     const storedMessages = [];
-    let before: string | undefined;
+    const checkpoint = this.summaryStore.getIngestCheckpoint(channel.id);
+    let cursorAfter = checkpoint?.lastMessageId;
     let synced = 0;
 
     try {
@@ -384,7 +395,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         const remaining = this.startupSyncMaxMessagesPerChannel - synced;
         const fetched = await channel.messages.fetch({
           limit: Math.min(100, remaining),
-          before,
+          ...(cursorAfter ? { after: cursorAfter } : {}),
         });
 
         if (fetched.size === 0) {
@@ -397,7 +408,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         );
 
         for (const message of batch) {
-          if (message.createdAt < cutoff) {
+          if (!checkpoint && message.createdAt < cutoff) {
             continue;
           }
 
@@ -413,19 +424,25 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
           }
         }
 
-        const oldest = fetched.last();
-        if (!oldest) {
+        const newest = batch[batch.length - 1];
+        if (!newest) {
           break;
         }
 
-        before = oldest.id;
-
-        if (oldest.createdAt < cutoff) {
-          break;
-        }
+        cursorAfter = newest.id;
       }
 
       this.summaryStore.saveMessages(storedMessages);
+
+      if (cursorAfter) {
+        const lastSynced = storedMessages[storedMessages.length - 1];
+        this.summaryStore.upsertIngestCheckpoint(
+          channel.id,
+          channel.guild?.id || null,
+          cursorAfter,
+          lastSynced?.createdAt || null,
+        );
+      }
     } catch (error) {
       console.error(
         `Erro ao sincronizar mensagens do canal ${channel.id} no startup:`,
@@ -460,13 +477,18 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     prompt: string,
   ): StoredMessage[] {
     const sinceIso = new Date(
-      Date.now() - 3 * 24 * 60 * 60 * 1000,
+      Date.now() - this.mentionContextHours * 60 * 60 * 1000,
     ).toISOString();
     const recentMessages = this.summaryStore.getStoredMessages(
       channelId,
       sinceIso,
       150,
     );
+
+    if (recentMessages.length === 0) {
+      return [];
+    }
+
     const relevantMessages = this.filterRelevantMessages(recentMessages, prompt);
 
     if (relevantMessages.length > 0) {
@@ -624,15 +646,9 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
             id: msg.id,
             authorId: msg.author.id,
             authorUsername: msg.author.username,
-            authorDisplayName:
-              msg.member?.displayName ||
-              msg.author.globalName ||
-              msg.author.username,
+            authorDisplayName: this.resolveAuthorDisplayName(msg),
             content: msg.content,
-            author:
-              msg.member?.displayName ||
-              msg.author.globalName ||
-              msg.author.username,
+            author: this.resolveAuthorDisplayName(msg),
             timestamp: msg.createdAt,
           });
           storedMessages.push(this.toStoredMessageInput(msg));
@@ -676,6 +692,18 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
+
+  private resolveAuthorDisplayName(message: any): string {
+    const guildMemberDisplayName =
+      message.guild?.members?.cache?.get(message.author.id)?.displayName;
+
+    return (
+      message.member?.displayName ||
+      guildMemberDisplayName ||
+      message.author.globalName ||
+      message.author.username
+    );
+  }
   private toStoredMessageInput(message: any) {
     return {
       guildId: message.guildId || null,
@@ -683,10 +711,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       messageId: message.id,
       authorId: message.author.id,
       authorUsername: message.author.username,
-      authorDisplayName:
-        message.member?.displayName ||
-        message.author.globalName ||
-        message.author.username,
+      authorDisplayName: this.resolveAuthorDisplayName(message),
       content: message.content,
       createdAt: message.createdAt.toISOString(),
     };
