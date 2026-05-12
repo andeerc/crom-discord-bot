@@ -28,6 +28,8 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
   private startupSyncHours: number;
   private startupSyncMaxMessagesPerChannel: number;
   private mentionContextHours: number;
+  private summarizePromptMaxChars: number;
+  private mentionPromptMaxChars: number;
 
   constructor(
     private config: ConfigService,
@@ -41,14 +43,23 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         GatewayIntentBits.MessageContent,
       ],
     });
+    const retentionDays = Number(
+      this.config.get("MESSAGE_RETENTION_DAYS") || 3,
+    );
     this.startupSyncHours = Number(
-      this.config.get("STARTUP_SYNC_HOURS") || 12,
+      this.config.get("STARTUP_SYNC_HOURS") || retentionDays * 24,
     );
     this.startupSyncMaxMessagesPerChannel = Number(
       this.config.get("STARTUP_SYNC_MAX_MESSAGES_PER_CHANNEL") || 500,
     );
     this.mentionContextHours = Number(
       this.config.get("MENTION_CONTEXT_HOURS") || 6,
+    );
+    this.summarizePromptMaxChars = Number(
+      this.config.get("SUMMARIZE_PROMPT_MAX_CHARS") || 12000,
+    );
+    this.mentionPromptMaxChars = Number(
+      this.config.get("MENTION_PROMPT_MAX_CHARS") || 10000,
     );
   }
 
@@ -105,12 +116,14 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         this.summaryStore.saveMessages([
           this.toStoredMessageInput(message),
         ]);
+        console.log(`Mensagem ingerida em tempo real no canal ${message.channelId}: ${message.id}`);
         this.summaryStore.upsertIngestCheckpoint(
           message.channelId,
           message.guildId || null,
           message.id,
           message.createdAt.toISOString(),
         );
+        console.log(`Checkpoint em tempo real atualizado no canal ${message.channelId}: ${message.id}`);
       } catch (error) {
         console.error("Erro ao persistir mensagem do canal:", error);
       }
@@ -145,7 +158,6 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     const options = interaction.options;
     const hoursAgo = options.getInteger("horas") || 1;
     const limit = options.getInteger("mensagens") || 50;
-    const checkpoint = this.summaryStore.getCheckpoint(channel.id);
     const latestSummary = this.summaryStore.getLatestSummary(channel.id);
 
     await interaction.deferReply();
@@ -154,47 +166,55 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     try {
       this.assertReadableChannel(interaction);
 
-      const messages = await this.fetchMessages(
-        channel,
-        hoursAgo,
-        limit,
-        checkpoint?.lastMessageId || null,
-      );
+      const messages = await this.fetchMessages(channel, hoursAgo, limit, null);
 
       if (messages.length === 0) {
         await interaction.editReply(
-          this.renderFailure(
-            checkpoint?.lastMessageId
-              ? "Nenhuma mensagem nova desde o ultimo resumo."
-              : "Nenhuma mensagem encontrada no periodo especificado.",
-          ),
+          this.renderFailure("Nenhuma mensagem encontrada no periodo especificado."),
         );
         return;
       }
 
       await interaction.editReply(
         this.renderProgress(
-          `Encontrei ${messages.length} mensagens novas. Preparando contexto`,
+          `Encontrei ${messages.length} mensagens. Preparando contexto`,
         ),
       );
 
       const formattedMessages = messages
         .map((message) => `[${message.author}]: ${message.content}`)
         .join("\n");
+      const messageChunks = this.splitContextIntoChunks(
+        formattedMessages,
+        this.summarizePromptMaxChars,
+      );
 
       await interaction.editReply(
-        this.renderProgress("Gerando resumo com OpenCode"),
+        this.renderProgress(`Gerando resumo com OpenCode (${messageChunks.length} parte(s))`),
       );
 
-      const summary = await this.summarizer.summarize(
-        formattedMessages,
-        latestSummary?.summary || null,
-      );
+      const partialSummaries: string[] = [];
+
+      for (let index = 0; index < messageChunks.length; index += 1) {
+        const summaryPart = await this.summarizer.summarize(
+          messageChunks[index],
+          index === 0 ? latestSummary?.summary || null : null,
+        );
+        partialSummaries.push(summaryPart);
+      }
+
+      const summary =
+        partialSummaries.length === 1
+          ? partialSummaries[0]
+          : await this.summarizer.mergeSummaries(
+              partialSummaries,
+              latestSummary?.summary || null,
+            );
 
       this.summaryStore.saveSummary({
         channelId: channel.id,
         guildId: interaction.guildId || null,
-        fromMessageId: checkpoint?.lastMessageId || null,
+        fromMessageId: messages[0]?.id || null,
         toMessageId: messages[messages.length - 1].id,
         fromTimestamp: messages[0].timestamp.toISOString(),
         toTimestamp: messages[messages.length - 1].timestamp.toISOString(),
@@ -207,7 +227,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
           summary,
           hoursAgo,
           messages.length,
-          checkpoint?.lastMessageId ? true : false,
+          false,
         ),
       );
     } catch (error) {
@@ -259,11 +279,29 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         prompt,
       );
       const formattedContext = this.formatStoredMessages(contextMessages);
-      const answer = await this.summarizer.answerMention(
-        prompt,
+      const contextChunks = this.splitContextIntoChunks(
         formattedContext,
-        latestSummary?.summary || null,
+        this.mentionPromptMaxChars,
       );
+      const partialAnswers: string[] = [];
+
+      for (const chunk of contextChunks) {
+        const partialAnswer = await this.summarizer.answerMention(
+          prompt,
+          chunk,
+          latestSummary?.summary || null,
+        );
+        partialAnswers.push(partialAnswer);
+      }
+
+      const answer =
+        partialAnswers.length === 1
+          ? partialAnswers[0]
+          : await this.summarizer.mergeMentionAnswers(
+              prompt,
+              partialAnswers,
+              latestSummary?.summary || null,
+            );
 
       const finalReply = await loadingReply.edit(answer);
       this.summaryStore.saveMessages([this.toStoredMessageInput(finalReply)]);
@@ -336,8 +374,10 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
 
   private async syncRecentMessagesOnStartup() {
     const guilds = Array.from(this.client.guilds.cache.values());
+    console.log(`Iniciando sync de startup em ${guilds.length} guild(s).`);
 
     for (const guild of guilds) {
+      console.log(`Sync startup: guild ${guild.id}`);
       try {
         await guild.channels.fetch();
         const channels = Array.from(guild.channels.cache.values());
@@ -387,18 +427,24 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     );
     const storedMessages = [];
     const checkpoint = this.summaryStore.getIngestCheckpoint(channel.id);
-    let cursorAfter = checkpoint?.lastMessageId;
+    console.log(`Sync startup: canal ${channel.id} | checkpoint=${checkpoint?.lastMessageId || "nenhum"} | janela=${this.startupSyncHours}h`);
+    const checkpointId = checkpoint?.lastMessageId
+      ? BigInt(checkpoint.lastMessageId)
+      : null;
     let synced = 0;
+    let newestSeenMessage: any | null = null;
+    let cursorBefore: string | undefined;
 
     try {
       while (synced < this.startupSyncMaxMessagesPerChannel) {
         const remaining = this.startupSyncMaxMessagesPerChannel - synced;
         const fetched = await channel.messages.fetch({
           limit: Math.min(100, remaining),
-          ...(cursorAfter ? { after: cursorAfter } : {}),
+          ...(cursorBefore ? { before: cursorBefore } : {}),
         });
 
         if (fetched.size === 0) {
+          console.log(`Sync startup: canal ${channel.id} sem mais mensagens para paginação.`);
           break;
         }
 
@@ -407,8 +453,17 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
           (left, right) => left.createdTimestamp - right.createdTimestamp,
         );
 
+        let reachedCheckpoint = false;
+        let reachedCutoff = false;
+
         for (const message of batch) {
-          if (!checkpoint && message.createdAt < cutoff) {
+          if (checkpointId && BigInt(message.id) <= checkpointId) {
+            reachedCheckpoint = true;
+            continue;
+          }
+
+          if (message.createdAt < cutoff) {
+            reachedCutoff = true;
             continue;
           }
 
@@ -417,6 +472,11 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
           }
 
           storedMessages.push(this.toStoredMessageInput(message));
+
+          if (!newestSeenMessage) {
+            newestSeenMessage = message;
+          }
+
           synced += 1;
 
           if (synced >= this.startupSyncMaxMessagesPerChannel) {
@@ -424,24 +484,34 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
           }
         }
 
-        const newest = batch[batch.length - 1];
-        if (!newest) {
+        const oldest = batch[0];
+        if (!oldest || reachedCheckpoint || reachedCutoff) {
+          if (reachedCheckpoint) {
+            console.log(`Sync startup: canal ${channel.id} parou ao atingir checkpoint.`);
+          }
+
+          if (reachedCutoff) {
+            console.log(`Sync startup: canal ${channel.id} parou ao atingir cutoff da janela.`);
+          }
+
           break;
         }
 
-        cursorAfter = newest.id;
+        cursorBefore = oldest.id;
       }
 
       this.summaryStore.saveMessages(storedMessages);
 
-      if (cursorAfter) {
-        const lastSynced = storedMessages[storedMessages.length - 1];
+      console.log(`Sync startup: canal ${channel.id} persistiu ${storedMessages.length} mensagem(ns).`);
+
+      if (newestSeenMessage) {
         this.summaryStore.upsertIngestCheckpoint(
           channel.id,
           channel.guild?.id || null,
-          cursorAfter,
-          lastSynced?.createdAt || null,
+          newestSeenMessage.id,
+          newestSeenMessage.createdAt?.toISOString?.() || null,
         );
+        console.log(`Sync startup: checkpoint atualizado no canal ${channel.id} para ${newestSeenMessage.id}.`);
       }
     } catch (error) {
       console.error(
@@ -621,6 +691,7 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         });
 
         if (fetched.size === 0) {
+          console.log(`Sync startup: canal ${channel.id} sem mais mensagens para paginação.`);
           break;
         }
 
@@ -715,6 +786,57 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
       content: message.content,
       createdAt: message.createdAt.toISOString(),
     };
+  }
+
+
+
+  private splitContextIntoChunks(content: string, maxChars: number): string[] {
+    if (content.length <= maxChars) {
+      return [content];
+    }
+
+    const chunks: string[] = [];
+    const lines = content.split("\n");
+    let current = "";
+
+    for (const line of lines) {
+      const next = current ? `${current}\n${line}` : line;
+
+      if (next.length <= maxChars) {
+        current = next;
+        continue;
+      }
+
+      if (current) {
+        chunks.push(current);
+      }
+
+      if (line.length <= maxChars) {
+        current = line;
+        continue;
+      }
+
+      for (let start = 0; start < line.length; start += maxChars) {
+        chunks.push(line.slice(start, start + maxChars));
+      }
+
+      current = "";
+    }
+
+    if (current) {
+      chunks.push(current);
+    }
+
+    return chunks;
+  }
+
+  private truncateForPrompt(content: string, maxChars: number): string {
+    if (content.length <= maxChars) {
+      return content;
+    }
+
+    const truncated = content.slice(content.length - maxChars);
+    return `[contexto truncado para caber no limite de ${maxChars} caracteres]\n${truncated}`;
   }
 
   private getUserFacingError(error: unknown): string {
