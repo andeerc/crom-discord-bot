@@ -275,8 +275,8 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
 
     try {
       const latestSummary = this.summaryStore.getLatestSummary(message.channelId);
-      const contextMessages = this.getMentionContextMessages(
-        message.channelId,
+      const contextMessages = await this.getMentionContextMessages(
+        message,
         prompt,
       );
       const formattedContext = this.formatStoredMessages(contextMessages);
@@ -543,18 +543,40 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
     return content.replace(mentionRegex, "").trim();
   }
 
-  private getMentionContextMessages(
-    channelId: string,
+  private async getMentionContextMessages(
+    message: Message,
     prompt: string,
-  ): StoredMessage[] {
+  ): Promise<StoredMessage[]> {
     const sinceIso = new Date(
       Date.now() - this.mentionContextHours * 60 * 60 * 1000,
     ).toISOString();
-    const recentMessages = this.summaryStore.getStoredMessages(
-      channelId,
+    let recentMessages = this.summaryStore.getStoredMessages(
+      message.channelId,
       sinceIso,
       150,
     );
+
+    if (recentMessages.length < 20) {
+      const fetchedMessages = await this.fetchMessages(
+        message.channel,
+        this.mentionContextHours,
+        150,
+        null,
+      );
+
+      if (fetchedMessages.length > 0) {
+        recentMessages = this.summaryStore.getStoredMessages(
+          message.channelId,
+          sinceIso,
+          150,
+        );
+      }
+    }
+
+    const botUserId = this.client.user?.id;
+    if (botUserId) {
+      recentMessages = recentMessages.filter((storedMessage) => storedMessage.authorId !== botUserId);
+    }
 
     if (recentMessages.length === 0) {
       return [];

@@ -323,13 +323,13 @@ export class SummaryStoreService {
           FROM channel_messages
           WHERE channel_id = ?
             AND created_at >= ?
-          ORDER BY created_at ASC
+          ORDER BY created_at DESC
           LIMIT ?
         `,
       )
       .all(channelId, sinceIso, limit);
 
-    return rows || [];
+    return (rows || []).reverse();
   }
 
   getIngestCheckpoint(channelId: string): IngestCheckpoint | null {
