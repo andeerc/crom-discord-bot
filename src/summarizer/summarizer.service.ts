@@ -180,6 +180,38 @@ export class SummarizerService {
     }
   }
 
+
+
+  async mergeMentionAnswers(
+    userPrompt: string,
+    partialAnswers: string[],
+    previousSummary: string | null = null,
+  ): Promise<string> {
+    const mergedInput = partialAnswers
+      .map((part, index) => `Resposta parcial ${index + 1}:\n${part}`)
+      .join("\n\n");
+
+    return this.answerMention(
+      userPrompt,
+      `Unifique as respostas parciais abaixo em uma unica resposta final, consistente e sem contradicoes.\n\n${mergedInput}`,
+      previousSummary,
+    );
+  }
+
+  async mergeSummaries(
+    partialSummaries: string[],
+    previousSummary: string | null = null,
+  ): Promise<string> {
+    const mergedInput = partialSummaries
+      .map((part, index) => `Parte ${index + 1}:\n${part}`)
+      .join("\n\n");
+
+    return this.summarize(
+      `Una os resumos parciais abaixo em um unico resumo coerente, sem perder informacoes importantes.\n\n${mergedInput}`,
+      previousSummary,
+    );
+  }
+
   private simpleSummarize(
     messages: string,
     previousSummary: string | null = null,
