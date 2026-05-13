@@ -12,6 +12,8 @@ import {
 import { StoredMessage, SummaryStoreService } from "src/storage/summary-store.service";
 import { SummarizerService } from "src/summarizer/summarizer.service";
 
+const DISCORD_MESSAGE_MAX_LENGTH = 2000;
+
 type FetchedMessage = {
   id: string;
   authorId: string;
@@ -223,7 +225,8 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
         summary,
       });
 
-      await interaction.editReply(
+      await this.replyWithChunks(
+        interaction,
         this.renderSummary(
           summary,
           hoursAgo,
@@ -827,6 +830,65 @@ export class DiscordService implements OnModuleInit, OnModuleDestroy {
 
       if (next.length <= maxChars) {
         current = next;
+        continue;
+      }
+
+      if (current) {
+        chunks.push(current);
+      }
+
+      if (line.length <= maxChars) {
+        current = line;
+        continue;
+      }
+
+      for (let start = 0; start < line.length; start += maxChars) {
+        chunks.push(line.slice(start, start + maxChars));
+      }
+
+      current = "";
+    }
+
+    if (current) {
+      chunks.push(current);
+    }
+
+    return chunks;
+  }
+
+  private async replyWithChunks(interaction: any, content: string) {
+    const chunks = this.splitContentForDiscord(content, DISCORD_MESSAGE_MAX_LENGTH);
+
+    if (chunks.length === 0) {
+      await interaction.editReply(" ");
+      return;
+    }
+
+    await interaction.editReply(chunks[0]);
+
+    for (let index = 1; index < chunks.length; index += 1) {
+      await interaction.followUp(chunks[index]);
+    }
+  }
+
+  private splitContentForDiscord(content: string, maxChars: number): string[] {
+    if (!content) {
+      return [];
+    }
+
+    if (content.length <= maxChars) {
+      return [content];
+    }
+
+    const chunks: string[] = [];
+    const lines = content.split("\n");
+    let current = "";
+
+    for (const line of lines) {
+      const candidate = current ? `${current}\n${line}` : line;
+
+      if (candidate.length <= maxChars) {
+        current = candidate;
         continue;
       }
 
